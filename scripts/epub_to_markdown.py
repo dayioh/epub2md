@@ -25,14 +25,18 @@ HTML_SPAN = re.compile(r'<span[^>]*>(.*?)</span>', re.DOTALL)
 HTML_EMPTY_SPAN = re.compile(r'<span[^>]*></span>')
 HTML_LINK = re.compile(r'<a\s+[^>]*href="([^"]+)"[^>]*>(.*?)</a>', re.DOTALL)
 HTML_CODE_BLOCK = re.compile(r'<pre>\s*<code([^>]*)>(.*?)</code>\s*</pre>', re.DOTALL | re.IGNORECASE)
+FENCED_CODE_BLOCK = re.compile(
+    r'(^[ \t]*)```([^\n]*)\n(.*?)\n^[ \t]*```', re.MULTILINE | re.DOTALL
+)
 INTERNAL_LINK = re.compile(r'\[([^\]]+)\]\(#([^)]+)\)')
 WIKILINK = re.compile(r'\[\[([^\]#]+)#([^|\]]+)(?:\|([^\]]+))?\]\]')
 TOC_SPACES = re.compile(r'^(\s*\d+)\.\s{2,}', re.MULTILINE)
 LIST_LINE_PATTERN = re.compile(r'^\s*(?:\d+\.\s|[-*+]\s)')
+IMAGE_DATA = re.compile(r'^!\[[^\]]*\]\((data:[^)]+)\)$')
+CODE_LINE_NUMBER = re.compile(r'^\s*\d{1,3}\s')
 NAV_PATTERN = re.compile(r'<nav[^>]*>.*?</nav>', re.DOTALL | re.IGNORECASE)
 ASIDE_PATTERN = re.compile(r'<aside[^>]*>(.*?)</aside>', re.DOTALL | re.IGNORECASE)
 FIGCAPTION_PATTERN = re.compile(r'<figcaption[^>]*>(.*?)</figcaption>', re.DOTALL | re.IGNORECASE)
-LIST_LINE_PATTERN = re.compile(r'^\s*(?:\d+\.\s|[-*+]\s)')
 
 
 def parse_metadata_block(block: str) -> dict[str, list[str]]:
@@ -168,6 +172,117 @@ def clean_html(body: str) -> str:
     return body
 
 
+def unwrap_prose_fences(markdown: str) -> str:
+    """Supprime les blocs ``` ``` qui contiennent en réalité du texte courant."""
+
+    def looks_like_prose(text: str) -> bool:
+        stripped = text.strip()
+        if len(stripped) < 80:
+            return False
+        if not re.search(r'\.[\s\n]', stripped):
+            return False
+        if re.search(r'[{}\[\]$#<>*/\\=]', stripped):
+            return False
+        letters = sum(ch.isalpha() for ch in stripped)
+        total = sum(ch not in '\n' for ch in stripped)
+        return total > 0 and letters / total > 0.65
+
+    def repl(match: re.Match[str]) -> str:
+        indent = match.group(1)
+        language = match.group(2).strip()
+        content = match.group(3)
+        if language:
+            return match.group(0)
+        if looks_like_prose(content):
+            return f'{content.strip()}\n'
+        return match.group(0)
+
+    return FENCED_CODE_BLOCK.sub(repl, markdown)
+
+
+def _infer_indent(text: str, fence_start: int, current: str) -> str:
+    if current:
+        return current
+    pos = fence_start
+    while pos > 0:
+        line_start = text.rfind('\n', 0, pos)
+        segment_start = 0 if line_start == -1 else line_start + 1
+        line = text[segment_start:pos]
+        pos = line_start
+        if not line:
+            continue
+        if line.strip() == '':
+            return line
+        if line.strip():
+            break
+    return ''
+
+
+def _apply_block_indent(lines: list[str], indent: str) -> list[str]:
+    indent_len = len(indent)
+
+    def pad(line: str) -> str:
+        if indent_len == 0:
+            return line
+        stripped = line.lstrip(' ')
+        current = len(line) - len(stripped)
+        if current >= indent_len:
+            return line
+        padding = ' ' * (indent_len - current)
+        return padding + line
+
+    return [pad(line) for line in lines]
+
+
+def strip_code_line_numbers(markdown: str) -> str:
+    """Supprime les numéros de lignes artificiels dans les blocs de code."""
+
+    def should_strip(lines: list[str]) -> bool:
+        if len(lines) < 3:
+            return False
+        numbered = sum(1 for line in lines if CODE_LINE_NUMBER.match(line))
+        threshold = max(3, int(len(lines) * 0.6))
+        return numbered >= threshold
+
+    def repl(match: re.Match[str]) -> str:
+        indent = _infer_indent(match.string, match.start(), match.group(1) or '')
+        language = match.group(2).strip()
+        content = match.group(3)
+        lines = content.splitlines()
+        if not should_strip(lines):
+            return match.group(0)
+        cleaned = []
+        for line in lines:
+            if CODE_LINE_NUMBER.match(line):
+                match_num = re.match(r'^(\s*)\d{1,3}(\s+)(.*)$', line)
+                if match_num:
+                    _indent, spacing, rest = match_num.groups()
+                    spacing = spacing[1:] if len(spacing) > 0 else ''
+                    cleaned.append(f'{spacing}{rest}')
+                    continue
+            cleaned.append(line)
+        adjusted = _apply_block_indent(cleaned, indent)
+        prefix = f'{indent}```{language}\n' if language else f'{indent}```\n'
+        return f'{prefix}' + '\n'.join(adjusted) + f'\n{indent}```'
+
+    return FENCED_CODE_BLOCK.sub(repl, markdown)
+
+
+def normalize_fence_indentation(markdown: str) -> str:
+    """Assure une indentation cohérente des blocs ``` imbriqués."""
+
+    def repl(match: re.Match[str]) -> str:
+        indent = _infer_indent(match.string, match.start(), match.group(1) or '')
+        language = match.group(2)
+        content = match.group(3)
+        lines = content.splitlines()
+        adjusted = _apply_block_indent(lines, indent)
+        prefix = f'{indent}```{language}\n' if language else f'{indent}```\n'
+        return f'{prefix}' + '\n'.join(adjusted) + f'\n{indent}```'
+
+    return FENCED_CODE_BLOCK.sub(repl, markdown)
+
+
 @dataclass(frozen=True)
 class ImageOptions:
     quality: int
@@ -205,11 +320,34 @@ def embed_images(markdown: str, media_root: Path, options: ImageOptions) -> str:
     """Remplace les chemins locaux par des data URI."""
     cache: dict[Path, tuple[str, str]] = {}
 
+    def resolve_image_path(src: str) -> Path | None:
+        path = Path(src)
+        candidates: list[Path] = []
+
+        if path.is_absolute():
+            candidates.append(path)
+        else:
+            base_dir = media_root.parent
+            candidates.append(base_dir / path)
+            candidates.append(media_root / path)
+            if path.parts and path.parts[0] == media_root.name:
+                if len(path.parts) > 1:
+                    remainder = Path(*path.parts[1:])
+                    candidates.append(media_root / remainder)
+                else:
+                    candidates.append(media_root)
+
+        for candidate in candidates:
+            resolved = candidate.resolve()
+            if resolved.exists():
+                return resolved
+        return None
+
     def repl(match: re.Match[str]) -> str:
         alt, src = match.group(1), match.group(2)
-        if not src.startswith(str(media_root)):
+        img_path = resolve_image_path(src)
+        if not img_path:
             return match.group(0)
-        img_path = Path(src)
         cached = cache.get(img_path)
         if not cached:
             try:
@@ -262,12 +400,39 @@ def is_list_line(line: str) -> bool:
     return bool(LIST_LINE_PATTERN.match(line))
 
 
+def dedupe_consecutive_images(markdown: str) -> str:
+    lines = markdown.splitlines()
+    cleaned: list[str] = []
+    last_data: str | None = None
+    for line in lines:
+        stripped = line.strip()
+        match = IMAGE_DATA.match(stripped)
+        if match:
+            data_uri = match.group(1)
+            if data_uri == last_data:
+                continue
+            last_data = data_uri
+        elif stripped:
+            last_data = None
+        cleaned.append(line)
+    return '\n'.join(cleaned)
+
+
 def compact_lists(markdown: str) -> str:
     """Uniformise les listes (espaces et lignes vides superflus)."""
     lines = markdown.splitlines()
     cleaned: list[str] = []
+    in_code_block = False
 
     for idx, original_line in enumerate(lines):
+        stripped = original_line.lstrip()
+        if stripped.startswith('```'):
+            in_code_block = not in_code_block
+            cleaned.append(original_line)
+            continue
+        if in_code_block:
+            cleaned.append(original_line)
+            continue
         line = re.sub(r'^(\s*\d+\.)\s+', r'\1 ', original_line)
         line = re.sub(r'^(\s*[-*+])\s+', r'\1 ', line)
         next_line = lines[idx + 1] if idx + 1 < len(lines) else ''
@@ -298,12 +463,13 @@ def normalize_wikilinks(markdown: str) -> str:
 
 def generate_table_of_contents(markdown: str, target_name: str) -> str:
     """Génère une table des matières Markdown à partir des titres de niveau 2."""
+    toc_markers = {'## Table of Contents', '## Contents'}
     lines = markdown.splitlines()
     headings: list[str] = []
     for line in lines:
-        if line.startswith('## ') and not line.startswith('## Table of Contents'):
+        if line.startswith('## '):
             title = line[3:].strip()
-            if title:
+            if title and title not in {'Table of Contents', 'Contents'}:
                 headings.append(title)
     if not headings:
         return markdown
@@ -313,9 +479,12 @@ def generate_table_of_contents(markdown: str, target_name: str) -> str:
         for idx, title in enumerate(headings, start=1)
     )
     toc_lines.append('')
-    try:
-        start = lines.index('## Table of Contents')
-    except ValueError:
+    start = None
+    for idx, line in enumerate(lines):
+        if line.strip() in toc_markers:
+            start = idx
+            break
+    if start is None:
         # Insère le toc au début après metadata
         return '\n'.join(toc_lines + [''] + lines)
     end = start + 1
@@ -398,14 +567,22 @@ def convert_epub(
     metadata, body = split_front_matter(raw_text)
     id_to_slug = build_anchor_map(body)
     body = clean_html(body)
+    body = unwrap_prose_fences(body)
+    body = strip_code_line_numbers(body)
+    body = normalize_fence_indentation(body)
     body = embed_images(body, media_dir, image_options)
+    body = dedupe_consecutive_images(body)
     body = rewrite_links(body, id_to_slug, output_path.name)
     body = compact_lists(body)
     body = fix_toc_spacing(body)
     body = merge_chapter_headings(body)
     body = normalize_wikilinks(body)
     body = generate_table_of_contents(body, output_path.name)
-    final_text = build_meta_block(metadata).strip() + '\n\n' + body.lstrip('\n')
+    meta_block = build_meta_block(metadata).strip()
+    if meta_block:
+        final_text = f'{meta_block}\n\n{body.lstrip()}'
+    else:
+        final_text = body.lstrip()
     output_path.write_text(final_text, encoding='utf-8')
 
 
@@ -422,25 +599,25 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         '--work-dir',
         type=Path,
-        default=Path('.epub-workdir'),
+        default=Path('/tmp/epub2md-workdir'),
         help='Dossier temporaire pour les ressources intermédiaires',
     )
     parser.add_argument(
         '--webp-quality',
         type=int,
         default=60,
-        help='Qualité WebP (0-100). 60 offre un bon compromis sous 10Mo.',
+        help='Qualité WebP (0-100). 60 offre un bon compromis.',
     )
     parser.add_argument(
         '--max-dimension',
         type=int,
-        default=1400,
+        default=6670,
         help='Taille maximale (px) appliquée seulement si l’image est plus grande.',
     )
     parser.add_argument(
         '--target-kb',
         type=int,
-        default=6,
+        default=60,
         help='Poids cible approximatif par image (en kilo-octets).',
     )
     parser.add_argument(
